@@ -1,0 +1,178 @@
+version: '3.8'
+
+# Network architecture for airgapped deployment
+# - vllm-external: Has internet (download phase only)
+# - vllm-internal: NO internet (production serving)
+# - llamaindex_internal: Shared with LlamaIndex (external reference)
+networks:
+  vllm-internal:
+    driver: bridge
+    internal: true  # NO internet - secure production network
+  vllm-external:
+    driver: bridge  # Has internet for downloads
+  llamaindex_internal:
+    external: true
+    name: llamaindex_internal
+
+services:
+  # =========================================================================
+  # MODEL DOWNLOADER - PHASE 1 (ONE-TIME USE)
+  # Downloads Qwen3-VL-4B-Instruct (~8GB) with internet access
+  # Run: docker-compose --profile download up qwen3vl-4b-downloader
+  # =========================================================================
+  qwen3vl-4b-downloader:
+    image: python:3.11-slim
+    container_name: qwen3vl-4b-downloader
+    networks:
+      - vllm-external  # Has internet for downloads
+    volumes:
+      - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HUB_DISABLE_TELEMETRY=1
+    command: >
+      sh -c "
+      echo '============================================' &&
+      echo 'Qwen3-VL-4B-Instruct Model Downloader' &&
+      echo '============================================' &&
+      pip install --quiet huggingface_hub &&
+      echo 'Downloading Qwen/Qwen3-VL-4B-Instruct (~8GB)...' &&
+      echo 'This may take 15-30 minutes depending on connection...' &&
+      python -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id=\"Qwen/Qwen3-VL-4B-Instruct\")' &&
+      echo '============================================' &&
+      echo 'Download complete!' &&
+      echo 'Verify with: ls -la /root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct' &&
+      ls -la /root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct 2>/dev/null || echo 'Model directory created' &&
+      echo '============================================' &&
+      echo 'Next: docker-compose --profile serve up -d vllm-qwen3vl-4b' &&
+      echo '============================================'
+      "
+    restart: "no"
+    profiles:
+      - download
+
+  # =========================================================================
+  # QWEN3-VL-4B SERVING - PHASE 2 (PRODUCTION)
+  # Airgapped serving with NO internet access
+  # Optimized for RTX 5090 32GB VRAM
+  # Run: docker-compose --profile serve up -d vllm-qwen3vl-4b
+  # =========================================================================
+  vllm-qwen3vl-4b:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-qwen3vl-4b-fork
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm-internal        # NO internet access (airgapped)
+      - llamaindex_internal  # Accessible from LlamaIndex
+    volumes:
+      - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-4B-Instruct
+      --served-model-name Qwen/Qwen3-VL-4B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 32768
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 16
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 65536
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-kwargs '{"max_pixels": 1003520, "min_pixels": 65536}'
+      --mm-processor-cache-gb 4
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve
+
+  # =========================================================================
+  # QWEN3-VL-4B SERVING - SHARED MODE (Lower VRAM)
+  # Use when running alongside other containers
+  # Uses ~21GB VRAM (65% utilization)
+  # Run: docker-compose --profile serve-shared up -d vllm-qwen3vl-4b-shared
+  # =========================================================================
+  vllm-qwen3vl-4b-shared:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-qwen3vl-4b-fork-shared
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm-internal        # NO internet access (airgapped)
+      - llamaindex_internal  # Accessible from LlamaIndex
+    volumes:
+      - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
+    environment:
+      - OMP_NUM_THREADS=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-4B-Instruct
+      --served-model-name Qwen/Qwen3-VL-4B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 8192
+      --gpu-memory-utilization 0.65
+      --trust-remote-code
+      --max-num-seqs 8
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 8192
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-kwargs '{"max_pixels": 1003520, "min_pixels": 65536}'
+      --mm-processor-cache-gb 2
+      --async-scheduling
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve-shared
