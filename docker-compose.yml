@@ -4,6 +4,7 @@ version: '3.8'
 # - vllm-external: Has internet (download phase only)
 # - vllm-internal: NO internet (production serving)
 # - llamaindex_internal: Shared with LlamaIndex (external reference)
+# - vllm-monitoring: Shared with main vLLM stack for Prometheus/Grafana
 networks:
   vllm-internal:
     driver: bridge
@@ -13,6 +14,9 @@ networks:
   llamaindex_internal:
     external: true
     name: llamaindex_internal
+  vllm-monitoring:
+    external: true
+    name: vllm_vllm-internal  # Main vLLM stack's internal network (for Prometheus)
 
 services:
   # =========================================================================
@@ -65,6 +69,7 @@ services:
     networks:
       - vllm-internal        # NO internet access (airgapped)
       - llamaindex_internal  # Accessible from LlamaIndex
+      - vllm-monitoring      # Prometheus/Grafana monitoring
     volumes:
       - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
     environment:
@@ -100,7 +105,7 @@ services:
       --max-num-batched-tokens 65536
       --limit-mm-per-prompt '{"image": 2, "video": 0}'
       --mm-processor-kwargs '{"max_pixels": 1003520, "min_pixels": 65536}'
-      --mm-processor-cache-gb 4
+      --mm-processor-cache-gb 0
       --async-scheduling
       --enable-auto-tool-choice
       --tool-call-parser qwen3_xml
@@ -131,6 +136,7 @@ services:
     networks:
       - vllm-internal        # NO internet access (airgapped)
       - llamaindex_internal  # Accessible from LlamaIndex
+      - vllm-monitoring      # Prometheus/Grafana monitoring
     volumes:
       - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
     environment:
