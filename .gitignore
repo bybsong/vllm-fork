@@ -230,3 +230,6 @@ ep_kernels_workspace/
 
 # HuggingFace model cache
 models/hub/
+
+# Open WebUI data (user accounts, chat history)
+open-webui-data/

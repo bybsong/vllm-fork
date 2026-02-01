@@ -1,22 +1,17 @@
-version: '3.8'
-
 # Network architecture for airgapped deployment
 # - vllm-external: Has internet (download phase only)
-# - vllm-internal: NO internet (production serving)
-# - llamaindex_internal: Shared with LlamaIndex (external reference)
-# - vllm-monitoring: Shared with main vLLM stack for Prometheus/Grafana
+# - vllm_internal: NO internet (production serving) - external, shared with other services
 networks:
-  vllm-internal:
-    driver: bridge
-    internal: true  # NO internet - secure production network
+  vllm_internal:
+    external: true
+    name: vllm_internal  # Airgapped network (internal=true), shared with ChartIndexAgent
   vllm-external:
     driver: bridge  # Has internet for downloads
-  llamaindex_internal:
-    external: true
-    name: llamaindex_internal
-  vllm-monitoring:
-    external: true
-    name: vllm_vllm-internal  # Main vLLM stack's internal network (for Prometheus)
+  proxy_bridge:
+    driver: bridge  # Bridge network for Tailscale routing
+    ipam:
+      config:
+        - subnet: 192.168.64.0/20  # Custom subnet (gap between 192.168.48 and 192.168.80)
 
 services:
   # =========================================================================
@@ -30,7 +25,7 @@ services:
     networks:
       - vllm-external  # Has internet for downloads
     volumes:
-      - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
     environment:
       - HF_TOKEN=${HF_TOKEN}
       - HF_HUB_DISABLE_TELEMETRY=1
@@ -48,7 +43,11 @@ services:
       echo 'Verify with: ls -la /root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct' &&
       ls -la /root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct 2>/dev/null || echo 'Model directory created' &&
       echo '============================================' &&
-      echo 'Next: docker-compose --profile serve up -d vllm-qwen3vl-4b' &&
+      echo 'Next steps - pick one:' &&
+      echo '  Stable v0.12: docker-compose --profile serve-v012 up -d' &&
+      echo '  Stable v0.13: docker-compose --profile serve-v013 up -d' &&
+      echo '  Latest:       docker-compose --profile serve-latest up -d' &&
+      echo '  Nightly:      docker-compose --profile serve-nightly up -d' &&
       echo '============================================'
       "
     restart: "no"
@@ -56,22 +55,57 @@ services:
       - download
 
   # =========================================================================
-  # QWEN3-VL-4B SERVING - PHASE 2 (PRODUCTION)
+  # MODEL DOWNLOADER - THINKING MODEL (ONE-TIME USE)
+  # Downloads Qwen3-VL-4B-Thinking (~8GB) with internet access
+  # Run: docker-compose --profile download-thinking up qwen3vl-4b-thinking-downloader
+  # =========================================================================
+  qwen3vl-4b-thinking-downloader:
+    image: python:3.11-slim
+    container_name: qwen3vl-4b-thinking-downloader
+    networks:
+      - vllm-external  # Has internet for downloads
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HUB_DISABLE_TELEMETRY=1
+    command: >
+      sh -c "
+      echo '============================================' &&
+      echo 'Qwen3-VL-4B-Thinking Model Downloader' &&
+      echo '============================================' &&
+      pip install --quiet huggingface_hub &&
+      echo 'Downloading Qwen/Qwen3-VL-4B-Thinking (~8GB)...' &&
+      echo 'This may take 15-30 minutes depending on connection...' &&
+      python -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id=\"Qwen/Qwen3-VL-4B-Thinking\")' &&
+      echo '============================================' &&
+      echo 'Download complete!' &&
+      echo 'Verify with: ls -la /root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Thinking' &&
+      ls -la /root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Thinking 2>/dev/null || echo 'Model directory created' &&
+      echo '============================================' &&
+      echo 'Next step:' &&
+      echo '  docker-compose --profile serve-thinking up -d' &&
+      echo '============================================'
+      "
+    restart: "no"
+    profiles:
+      - download-thinking
+
+  # =========================================================================
+  # QWEN3-VL-4B SERVING - NIGHTLY (Bleeding Edge)
   # Airgapped serving with NO internet access
   # Optimized for RTX 5090 32GB VRAM
-  # Run: docker-compose --profile serve up -d vllm-qwen3vl-4b
+  # Run: docker-compose --profile serve-nightly up -d vllm-qwen3vl-4b-nightly
   # =========================================================================
-  vllm-qwen3vl-4b:
+  vllm-qwen3vl-4b-nightly:
     image: vllm/vllm-openai:nightly
-    container_name: vllm-qwen3vl-4b-fork
+    container_name: vllm-qwen3vl-4b-nightly
     ports:
       - "8000:8000"
     networks:
-      - vllm-internal        # NO internet access (airgapped)
-      - llamaindex_internal  # Accessible from LlamaIndex
-      - vllm-monitoring      # Prometheus/Grafana monitoring
+      - vllm_internal        # NO internet access (airgapped)
     volumes:
-      - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
     environment:
       # CPU thread optimization for AMD 9950X3D
       - OMP_NUM_THREADS=1
@@ -120,7 +154,263 @@ services:
       retries: 3
       start_period: 120s
     profiles:
-      - serve
+      - serve-nightly
+
+  # =========================================================================
+  # QWEN3-VL-4B SERVING - STABLE v0.12.0 (Rock-Solid Fallback)
+  # PyTorch 2.9.0, CUDA 12.9 - Released Dec 3, 2025
+  # Run: docker-compose --profile serve-v012 up -d vllm-qwen3vl-4b-v012
+  # =========================================================================
+  vllm-qwen3vl-4b-v012:
+    image: vllm/vllm-openai:v0.12.0
+    container_name: vllm-qwen3vl-4b-v012
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-4B-Instruct
+      --served-model-name Qwen/Qwen3-VL-4B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 32768
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 16
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 65536
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve-v012
+
+  # =========================================================================
+  # QWEN3-VL-4B SERVING - STABLE v0.13.0 (Latest Stable)
+  # Released Dec 19, 2025
+  # Run: docker-compose --profile serve-v013 up -d vllm-qwen3vl-4b-v013
+  # =========================================================================
+  vllm-qwen3vl-4b-v013:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: vllm-qwen3vl-4b-v013
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-4B-Instruct
+      --served-model-name Qwen/Qwen3-VL-4B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 32768
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 16
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 65536
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve-v013
+
+  # =========================================================================
+  # QWEN3-VL-4B SERVING - LATEST (Pinned to v0.13.0)
+  # Was 'latest' but pinned for stability after prefix-caching bug
+  # Run: docker-compose --profile serve-latest up -d vllm-qwen3vl-4b-latest
+  # =========================================================================
+  vllm-qwen3vl-4b-latest:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: vllm-qwen3vl-4b-latest
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-4B-Instruct
+      --served-model-name Qwen/Qwen3-VL-4B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 32768
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 16
+      --no-enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 65536
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve-latest
+
+  # =========================================================================
+  # QWEN3-VL-4B SERVING - THINKING (Reasoning Model)
+  # Same config as latest but using the Thinking model variant
+  # Run: docker-compose --profile serve-thinking up -d vllm-qwen3vl-4b-thinking
+  # =========================================================================
+  vllm-qwen3vl-4b-thinking:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: vllm-qwen3vl-4b-thinking
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-4B-Thinking
+      --served-model-name Qwen/Qwen3-VL-4B-Thinking
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 32768
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 16
+      --no-enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 65536
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve-thinking
 
   # =========================================================================
   # QWEN3-VL-4B SERVING - SHARED MODE (Lower VRAM)
@@ -134,11 +424,9 @@ services:
     ports:
       - "8000:8000"
     networks:
-      - vllm-internal        # NO internet access (airgapped)
-      - llamaindex_internal  # Accessible from LlamaIndex
-      - vllm-monitoring      # Prometheus/Grafana monitoring
+      - vllm_internal        # NO internet access (airgapped)
     volumes:
-      - C:\Users\bybso\vllm-fork\models\hub:/root/.cache/huggingface/hub
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
     environment:
       - OMP_NUM_THREADS=1
       - HF_HUB_DISABLE_TELEMETRY=1
@@ -182,4 +470,94 @@ services:
       retries: 3
       start_period: 120s
     profiles:
+      - serve-shared
+
+  # =========================================================================
+  # NGINX API PROXY (Tailscale Routing)
+  # Routes external requests to vLLM containers
+  # Accessible via Tailscale on proxy_bridge network
+  # Port exposed: 8080 (matches tesseract pattern)
+  # =========================================================================
+  # =========================================================================
+  # NGINX API PROXY (Tailscale Routing)
+  # Routes external requests to vLLM containers
+  # Accessible via Tailscale on proxy_bridge network
+  # Port exposed: 8080 (matches tesseract pattern)
+  # Update nginx/api-proxy.conf to change target container
+  # =========================================================================
+  api-proxy:
+    image: nginx:alpine
+    container_name: vllm-api-proxy
+    volumes:
+      - ./nginx/api-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - vllm_internal  # Can reach vLLM containers
+      - proxy_bridge   # Bridge network for Tailscale routing
+    ports:
+      - "8081:80"  # Port 8080 is used by tesseract api-proxy
+    restart: unless-stopped
+    profiles:
+      - serve-latest
+      - serve-nightly
+      - serve-v012
+      - serve-v013
+      - serve-thinking
+      - serve-shared
+
+  # =========================================================================
+  # OPEN WEBUI - Chat Interface for vLLM
+  # Secure, open-source chat GUI with vision support
+  # Access: http://localhost:3001 or http://YOUR_TAILSCALE_IP:3001
+  # First user to sign up becomes admin
+  # Run: docker-compose --profile webui up -d open-webui
+  # Note: Port 3000 is used by Grafana, so we use 3001
+  # =========================================================================
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: vllm-open-webui
+    networks:
+      - vllm_internal  # Can reach vLLM containers directly
+      - proxy_bridge   # Bridge network for Tailscale routing
+    ports:
+      - "127.0.0.1:3001:8080"  # Localhost only - Tailscale routes through this
+    volumes:
+      - ${OPENWEBUI_DATA_ROOT}/data:/app/backend/data
+    environment:
+      # Point to nginx proxy (routes to active vLLM container)
+      - OPENAI_API_BASE_URL=http://vllm-api-proxy:80/v1
+      - OPENAI_API_KEY=not-needed
+      # Disable Ollama (we only use OpenAI-compatible vLLM)
+      - OLLAMA_BASE_URL=
+      - ENABLE_OLLAMA_API=false
+      # Security: disable telemetry and external calls
+      - SCARF_NO_ANALYTICS=true
+      - DO_NOT_TRACK=true
+      - ANONYMIZED_TELEMETRY=false
+      # Disable features that need internet
+      - ENABLE_RAG_WEB_SEARCH=false
+      - ENABLE_IMAGE_GENERATION=false
+      # Disable RAG/embedding features (prevents model downloads)
+      - RAG_EMBEDDING_ENGINE=
+      - ENABLE_RAG_LOCAL_WEB_FETCH=false
+      - ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION=false
+      - CHUNK_SIZE=0
+      - CHUNK_OVERLAP=0
+      # Disable external model fetching
+      - ENABLE_COMMUNITY_SHARING=false
+      - ENABLE_MODEL_FILTER=false
+      # Auth settings (first signup becomes admin)
+      - WEBUI_AUTH=true
+      - ENABLE_SIGNUP=true
+      # Default model (matches your vLLM served model)
+      - DEFAULT_MODELS=Qwen/Qwen3-VL-4B-Instruct
+    restart: unless-stopped
+    depends_on:
+      - api-proxy
+    profiles:
+      - webui
+      - serve-latest
+      - serve-nightly
+      - serve-v012
+      - serve-v013
+      - serve-thinking
       - serve-shared
