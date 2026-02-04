@@ -1,3 +1,9 @@
+# Docker volumes for model storage (avoids Windows symlink issues)
+# Docker volumes use ext4 in WSL2 where symlinks work correctly
+volumes:
+  nemotron-hf-cache:
+    name: nemotron-hf-cache
+
 # Network architecture for airgapped deployment
 # - vllm-external: Has internet (download phase only)
 # - vllm_internal: NO internet (production serving) - external, shared with other services
@@ -53,6 +59,55 @@ services:
     restart: "no"
     profiles:
       - download
+
+  # =========================================================================
+  # MODEL DOWNLOADER - NEMOTRON PARSE v1.1 (ONE-TIME USE)
+  # Downloads nvidia/NVIDIA-Nemotron-Parse-v1.1 (~2GB) with internet access
+  # Document parsing/OCR model for text, tables, and layout extraction
+  # Run: docker-compose --profile download-nemotron-parse up nemotron-parse-downloader
+  # =========================================================================
+  nemotron-parse-downloader:
+    image: vllm/vllm-openai:v0.14.1
+    container_name: nemotron-parse-downloader
+    networks:
+      - vllm-external  # Has internet for downloads
+    volumes:
+      # Docker volume (ext4 in WSL2) - symlinks work correctly here
+      - nemotron-hf-cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HUB_DISABLE_TELEMETRY=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo '============================================'
+        echo 'NVIDIA Nemotron Parse v1.1 Model Downloader'
+        echo '============================================'
+        echo 'Step 1: Installing required packages...'
+        pip install open_clip_torch albumentations timm
+        echo 'Step 2: Downloading models and pre-warming cache...'
+        echo 'This loads the model once to compile dynamic modules'
+        echo '(Required for offline mode to work)'
+        python3 -c 'import torch; from transformers import AutoConfig; print("Loading Nemotron Parse config..."); config = AutoConfig.from_pretrained("nvidia/NVIDIA-Nemotron-Parse-v1.1", trust_remote_code=True); print("Config loaded successfully!")'
+        echo '============================================'
+        echo 'Download and cache warm-up complete!'
+        ls -la /root/.cache/huggingface/hub/
+        ls -la /root/.cache/huggingface/modules/
+        echo '============================================'
+        echo 'Next step:'
+        echo '  docker-compose --profile serve-nemotron-parse up -d'
+        echo '============================================'
+    restart: "no"
+    profiles:
+      - download-nemotron-parse
 
   # =========================================================================
   # MODEL DOWNLOADER - THINKING MODEL (ONE-TIME USE)
@@ -413,6 +468,263 @@ services:
       - serve-thinking
 
   # =========================================================================
+  # QWEN3-VL-8B SERVING - NIGHTLY (Bleeding Edge)
+  # Airgapped serving with NO internet access
+  # Optimized for RTX 5090 32GB VRAM
+  # Run: docker-compose --profile serve-8b-nightly up -d vllm-qwen3vl-8b-nightly
+  # =========================================================================
+  vllm-qwen3vl-8b-nightly:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-qwen3vl-8b-nightly
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-8B-Instruct
+      --served-model-name Qwen/Qwen3-VL-8B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 16384
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 12
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 16384
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    profiles:
+      - serve-8b-nightly
+
+  # =========================================================================
+  # QWEN3-VL-8B SERVING - STABLE v0.12.0 (Rock-Solid Fallback)
+  # PyTorch 2.9.0, CUDA 12.9 - Released Dec 3, 2025
+  # Run: docker-compose --profile serve-8b-v012 up -d vllm-qwen3vl-8b-v012
+  # =========================================================================
+  vllm-qwen3vl-8b-v012:
+    image: vllm/vllm-openai:v0.12.0
+    container_name: vllm-qwen3vl-8b-v012
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-8B-Instruct
+      --served-model-name Qwen/Qwen3-VL-8B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 16384
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 12
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 16384
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    profiles:
+      - serve-8b-v012
+
+  # =========================================================================
+  # QWEN3-VL-8B SERVING - STABLE v0.13.0 (Latest Stable)
+  # Released Dec 19, 2025
+  # Run: docker-compose --profile serve-8b-v013 up -d vllm-qwen3vl-8b-v013
+  # =========================================================================
+  vllm-qwen3vl-8b-v013:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: vllm-qwen3vl-8b-v013
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-8B-Instruct
+      --served-model-name Qwen/Qwen3-VL-8B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 16384
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 12
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 16384
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    profiles:
+      - serve-8b-v013
+
+  # =========================================================================
+  # QWEN3-VL-8B SERVING - LATEST (Pinned to v0.13.0)
+  # Was 'latest' but pinned for stability after prefix-caching bug
+  # Run: docker-compose --profile serve-8b-latest up -d vllm-qwen3vl-8b-latest
+  # =========================================================================
+  vllm-qwen3vl-8b-latest:
+    image: vllm/vllm-openai:v0.13.0
+    container_name: vllm-qwen3vl-8b-latest
+    ports:
+      - "8000:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      - ${VLLM_DATA_ROOT}/models/hub:/root/.cache/huggingface/hub
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model Qwen/Qwen3-VL-8B-Instruct
+      --served-model-name Qwen/Qwen3-VL-8B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --max-model-len 16384
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 12
+      --no-enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-batched-tokens 16384
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-cache-gb 0
+      --async-scheduling
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --logprobs-mode processed_logprobs
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    profiles:
+      - serve-8b-latest
+
+  # =========================================================================
   # QWEN3-VL-4B SERVING - SHARED MODE (Lower VRAM)
   # Use when running alongside other containers
   # Uses ~21GB VRAM (65% utilization)
@@ -473,6 +785,122 @@ services:
       - serve-shared
 
   # =========================================================================
+  # NEMOTRON PARSE v1.1 - DOCUMENT PARSING/OCR MODEL
+  # Vision-language model for document understanding
+  # Extracts text, tables, layout elements with bounding boxes
+  # Output: Markdown + LaTeX tables + spatial coordinates
+  # Port: 8002 (can run alongside Qwen on 8000)
+  # Requires: vLLM v0.14.1+ (model support added in main)
+  # Run: docker-compose --profile serve-nemotron-parse up -d vllm-nemotron-parse
+  # =========================================================================
+  vllm-nemotron-parse:
+    image: vllm/vllm-openai:v0.14.1
+    container_name: vllm-nemotron-parse
+    ports:
+      - "8002:8000"
+    networks:
+      - vllm-external        # TEMPORARY: Has internet for initial model loading
+    volumes:
+      # Docker volume with HF cache (symlinks work in ext4)
+      # NOT read-only - transformers needs to write to /modules for dynamic code
+      - nemotron-hf-cache:/root/.cache/huggingface
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # TEMPORARY: Allow network for model loading - switch to vllm_internal after first successful start
+      #- HF_HUB_OFFLINE=1
+      #- TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model nvidia/NVIDIA-Nemotron-Parse-v1.1
+      --served-model-name nvidia/NVIDIA-Nemotron-Parse-v1.1
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --gpu-memory-utilization 0.85
+      --trust-remote-code
+      --max-num-seqs 8
+      --limit-mm-per-prompt '{"image": 1}'
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve-nemotron-parse
+
+  # =========================================================================
+  # NEMOTRON PARSE v1.1 - NIGHTLY (Bleeding Edge)
+  # Use if v0.14.1 has issues - nightly has latest fixes
+  # Run: docker-compose --profile serve-nemotron-parse-nightly up -d
+  # =========================================================================
+  vllm-nemotron-parse-nightly:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-nemotron-parse-nightly
+    ports:
+      - "8002:8000"
+    networks:
+      - vllm_internal        # NO internet access (airgapped)
+    volumes:
+      # Docker volume with HF cache (symlinks work in ext4)
+      # NOT read-only - transformers needs to write to /modules for dynamic code
+      - nemotron-hf-cache:/root/.cache/huggingface
+    environment:
+      # CPU thread optimization for AMD 9950X3D
+      - OMP_NUM_THREADS=1
+      # Telemetry disabled
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USAGE_SOURCE=production-docker-isolated
+      # Offline mode - prevents any network calls
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: >
+      --model nvidia/NVIDIA-Nemotron-Parse-v1.1
+      --served-model-name nvidia/NVIDIA-Nemotron-Parse-v1.1
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+      --gpu-memory-utilization 0.90
+      --trust-remote-code
+      --max-num-seqs 8
+      --limit-mm-per-prompt '{"image": 1}'
+      --skip-mm-profiling
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    profiles:
+      - serve-nemotron-parse-nightly
+
+  # =========================================================================
   # NGINX API PROXY (Tailscale Routing)
   # Routes external requests to vLLM containers
   # Accessible via Tailscale on proxy_bridge network
@@ -503,6 +931,12 @@ services:
       - serve-v013
       - serve-thinking
       - serve-shared
+      - serve-8b-latest
+      - serve-8b-nightly
+      - serve-8b-v012
+      - serve-8b-v013
+      - serve-nemotron-parse
+      - serve-nemotron-parse-nightly
 
   # =========================================================================
   # OPEN WEBUI - Chat Interface for vLLM
@@ -519,7 +953,7 @@ services:
       - vllm_internal  # Can reach vLLM containers directly
       - proxy_bridge   # Bridge network for Tailscale routing
     ports:
-      - "127.0.0.1:3001:8080"  # Localhost only - Tailscale routes through this
+      - "0.0.0.0:3001:8080"  # Accessible via Tailscale and localhost
     volumes:
       - ${OPENWEBUI_DATA_ROOT}/data:/app/backend/data
     environment:
@@ -549,7 +983,7 @@ services:
       - WEBUI_AUTH=true
       - ENABLE_SIGNUP=true
       # Default model (matches your vLLM served model)
-      - DEFAULT_MODELS=Qwen/Qwen3-VL-4B-Instruct
+      - DEFAULT_MODELS=Qwen/Qwen3-VL-8B-Instruct
     restart: unless-stopped
     depends_on:
       - api-proxy
@@ -561,3 +995,9 @@ services:
       - serve-v013
       - serve-thinking
       - serve-shared
+      - serve-8b-latest
+      - serve-8b-nightly
+      - serve-8b-v012
+      - serve-8b-v013
+      - serve-nemotron-parse
+      - serve-nemotron-parse-nightly
